@@ -33,11 +33,11 @@ exponential backoff.
    Credentials** grant.
 2. The role assigned to that client must:
    - include the Agent Copilot **suggestions view** permission
-     (e.g. *Assistants → Suggestion → View*; naming can vary by org), and
-   - be **assigned to the division** that owns the conversations. Conversation
-     IDs you pass are expected to come from a single division — a `403` on the
-     suggestions call almost always means the client's role is not in that
-     division.
+     (e.g. *Assistants → Suggestion → View*; naming can vary by org),
+   - include **Analytics → Conversation Detail → View** (needed by discovery
+     mode's conversation-details query), and
+   - be **assigned to the division** you query — a `403` almost always means
+     the client's role is not in that division.
 3. TLS 1.2 must be the OS default (Windows 10/11 / Server 2019+ already is).
    CLM blocks `[Net.ServicePointManager]::SecurityProtocol`, so if you see
    *"Could not create SSL/TLS secure channel"* fix it machine-wide via the
@@ -65,27 +65,40 @@ embedded values when supplied.
 
 ## Usage
 
-Single conversation (embedded region + credentials, nothing else needed):
+### Discovery mode (recommended) — just give it a division ID
+
+The script finds the conversation IDs itself via
+`POST /api/v2/analytics/conversations/details/query` (filtered on the
+`divisionId` dimension, newest first), then pulls suggestions for each.
+Default window: the last 7 days.
+
+```powershell
+.\Get-GcConversationSuggestions.ps1 `
+    -DivisionId '11111111-2222-3333-4444-555555555555'
+```
+
+Custom date range and cap (ranges over 7 days are split into 7-day analytics
+windows automatically):
+
+```powershell
+.\Get-GcConversationSuggestions.ps1 `
+    -DivisionId '11111111-2222-3333-4444-555555555555' `
+    -StartDate (Get-Date).AddDays(-30) -EndDate (Get-Date) `
+    -MaxConversations 2000 `
+    -OutputCsv C:\Reports\suggestions.csv `
+    -OutputJson C:\Reports\suggestions.json
+```
+
+### Explicit mode — you already have the conversation IDs
 
 ```powershell
 .\Get-GcConversationSuggestions.ps1 `
     -ConversationId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 ```
 
-Multiple conversations, with a division guard and both exports:
-
-```powershell
-$convIds = @(
-    'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
-    'ffffffff-1111-2222-3333-444444444444'
-)
-
-.\Get-GcConversationSuggestions.ps1 `
-    -ConversationId $convIds `
-    -DivisionId '11111111-2222-3333-4444-555555555555' `
-    -OutputCsv C:\Reports\suggestions.csv `
-    -OutputJson C:\Reports\suggestions.json
-```
+When both `-ConversationId` and `-DivisionId` are supplied, the division ID
+acts as a guard: each conversation's division is verified via
+`GET /api/v2/conversations/{id}` and mismatches are skipped with a warning.
 
 Re-use an existing bearer token (skips the token request entirely):
 
@@ -101,8 +114,10 @@ Re-use an existing bearer token (skips the token request entirely):
 | `-Region` | no | Region domain only; defaults to embedded `mypurecloud.com.au` (Australia) |
 | `-ClientId` / `-ClientSecret` | no | Override the embedded Client Credentials pair |
 | `-AccessToken` | no | Existing bearer token; bypasses the token request |
-| `-ConversationId` | yes | One or more conversation IDs (same division) |
-| `-DivisionId` | no | Verifies each conversation's division via `GET /api/v2/conversations/{id}` first; mismatches are skipped with a warning |
+| `-DivisionId` | yes* | Division to pull from. Alone → discovery mode; combined with `-ConversationId` → division guard |
+| `-ConversationId` | yes* | Explicit conversation IDs (*provide this or `-DivisionId`) |
+| `-StartDate` / `-EndDate` | no | Discovery window (default: last 7 days → now) |
+| `-MaxConversations` | no | Discovery cap, newest first (default 500, max 10000) |
 | `-PageSize` | no | Suggestions page size, 1–500 (default 100) |
 | `-OutputCsv` | no | CSV path (default `.\GcSuggestions_<timestamp>.csv`) |
 | `-OutputJson` | no | Also dump the raw suggestion objects as pretty JSON |
@@ -124,5 +139,6 @@ types still land there even if the flattened columns stay empty.
 | `401` on token request | Wrong client ID/secret, or wrong region's login host |
 | `no access_token was returned` | OAuth client isn't a Client Credentials grant |
 | `403` on suggestions call | Role missing suggestions permission, or role not assigned to the conversation's division |
-| `404` | Bad conversation ID, or the conversation lives in a different region/org |
+| `404` on a suggestions call | Counted as "no suggestions" and skipped — normal for conversations where Agent Copilot was never active |
+| Discovery finds 0 conversations | Wrong division ID, empty date range, or the analytics permission is missing |
 | Repeated `429` warnings | Normal — the script honors `Retry-After` and backs off automatically |

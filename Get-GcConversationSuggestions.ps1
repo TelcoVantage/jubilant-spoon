@@ -49,12 +49,32 @@
     (ClientId/ClientSecret are then ignored).
 
 .PARAMETER ConversationId
-    One or more conversation IDs (all from the same division).
+    Optional. One or more explicit conversation IDs (all from the same
+    division). When omitted, supply -DivisionId instead and the script
+    discovers the conversation IDs dynamically.
 
 .PARAMETER DivisionId
-    Optional. When supplied, each conversation is first fetched from
-    GET /api/v2/conversations/{id} and its division is verified against this
-    ID; conversations outside the division are skipped with a warning.
+    The division ID to work with. Two behaviors:
+      * -ConversationId OMITTED: conversation IDs are discovered dynamically
+        for this division via POST /api/v2/analytics/conversations/details/query
+        (filtered on the divisionId dimension, newest first, within
+        -StartDate/-EndDate). Requires the analytics conversationDetail view
+        permission on the OAuth client's role.
+      * -ConversationId SUPPLIED: acts as a guard - each conversation is
+        fetched from GET /api/v2/conversations/{id} and its division verified;
+        mismatches are skipped with a warning.
+
+.PARAMETER StartDate
+    Discovery-mode only: start of the conversation search window
+    (default: 7 days ago). Ranges longer than 7 days are automatically
+    split into 7-day analytics queries.
+
+.PARAMETER EndDate
+    Discovery-mode only: end of the conversation search window (default: now).
+
+.PARAMETER MaxConversations
+    Discovery-mode only: safety cap on how many conversations are pulled from
+    analytics before fetching suggestions (default 500, newest first).
 
 .PARAMETER PageSize
     Suggestions page size (default 100).
@@ -67,16 +87,24 @@
     as pretty-printed JSON for full-fidelity inspection.
 
 .EXAMPLE
-    # Uses the embedded region + credentials - only the conversation ID needed
+    # DISCOVERY MODE: give it a division ID, it finds the conversations itself
+    # (last 7 days by default) and pulls suggestions for each.
     .\Get-GcConversationSuggestions.ps1 `
-        -ConversationId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        -DivisionId '11111111-2222-3333-4444-555555555555'
 
 .EXAMPLE
+    # Discovery over a custom window with a bigger cap and both exports
     .\Get-GcConversationSuggestions.ps1 `
-        -ConversationId $convIds `
         -DivisionId '11111111-2222-3333-4444-555555555555' `
+        -StartDate (Get-Date).AddDays(-30) -EndDate (Get-Date) `
+        -MaxConversations 2000 `
         -OutputCsv C:\Reports\suggestions.csv `
         -OutputJson C:\Reports\suggestions.json
+
+.EXAMPLE
+    # Explicit conversation ID (embedded region + credentials)
+    .\Get-GcConversationSuggestions.ps1 `
+        -ConversationId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 #>
 
 [CmdletBinding()]
@@ -93,11 +121,21 @@ param(
     [Parameter(Mandatory = $false)]
     [string]$AccessToken = '',
 
-    [Parameter(Mandatory = $true)]
-    [string[]]$ConversationId,
+    [Parameter(Mandatory = $false)]
+    [string[]]$ConversationId = @(),
 
     [Parameter(Mandatory = $false)]
     [string]$DivisionId = '',
+
+    [Parameter(Mandatory = $false)]
+    [datetime]$StartDate = (Get-Date).AddDays(-7),
+
+    [Parameter(Mandatory = $false)]
+    [datetime]$EndDate = (Get-Date),
+
+    [Parameter(Mandatory = $false)]
+    [ValidateRange(1, 10000)]
+    [int]$MaxConversations = 500,
 
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 500)]
@@ -351,6 +389,105 @@ function Test-GcConversationDivision {
 }
 
 # ---------------------------------------------------------------------------
+# Discovery mode: find conversation IDs in a division dynamically via
+# POST /api/v2/analytics/conversations/details/query, filtered on the
+# divisionId dimension, newest first. The analytics API caps a single query
+# interval at 7 days and a page at 100 rows, so wider date ranges are split
+# into 7-day windows and each window is paged until exhausted.
+# ---------------------------------------------------------------------------
+function Get-GcConversationIdsByDivision {
+    param(
+        [Parameter(Mandatory = $true)][string]$ApiBase,
+        [Parameter(Mandatory = $true)][hashtable]$Headers,
+        [Parameter(Mandatory = $true)][string]$DivId,
+        [Parameter(Mandatory = $true)][datetime]$From,
+        [Parameter(Mandatory = $true)][datetime]$To,
+        [int]$Cap = 500
+    )
+
+    if ($From -ge $To) {
+        throw ('-StartDate (' + [string]$From + ') must be earlier than -EndDate (' + [string]$To + ').')
+    }
+
+    $ids  = @()
+    $seen = @{}   # de-dupe: a conversation can span analytics windows
+
+    # Walk BACKWARD from -EndDate in 7-day windows so "newest first" holds
+    # across windows, not just inside one - the cap then keeps the most
+    # recent conversations.
+    $windowEnd = $To
+    while (($windowEnd -gt $From) -and ($ids.Count -lt $Cap)) {
+        $windowStart = $windowEnd.AddDays(-7)
+        if ($windowStart -lt $From) { $windowStart = $From }
+
+        $interval = $windowStart.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fff') + 'Z/' + `
+                    $windowEnd.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fff') + 'Z'
+        Write-Host ('  Analytics window: ' + $interval)
+
+        $pageNumber = 0
+        $maxPagesPerWindow = 100
+        while (($pageNumber -lt $maxPagesPerWindow) -and ($ids.Count -lt $Cap)) {
+            $pageNumber++
+
+            $queryBody = @{
+                interval       = $interval
+                order          = 'desc'
+                orderBy        = 'conversationStart'
+                paging         = @{
+                    pageSize   = 100
+                    pageNumber = $pageNumber
+                }
+                segmentFilters = @(
+                    @{
+                        type       = 'or'
+                        predicates = @(
+                            @{
+                                dimension = 'divisionId'
+                                value     = $DivId
+                            }
+                        )
+                    }
+                )
+            }
+            $queryJson = ConvertTo-Json -InputObject $queryBody -Depth 10
+
+            $resp = Invoke-GcApi -Method 'Post' `
+                                 -Uri ($ApiBase + '/api/v2/analytics/conversations/details/query') `
+                                 -Headers $Headers `
+                                 -Body $queryJson
+
+            $convs = $null
+            if ($null -ne $resp) { $convs = Get-Prop -InputObject $resp -Name 'conversations' }
+            $convArr = @()
+            if ($null -ne $convs) { $convArr = @($convs) }
+            if ($convArr.Count -eq 0) { break }   # window exhausted
+
+            foreach ($c in $convArr) {
+                $cId = Get-Prop -InputObject $c -Name 'conversationId'
+                if (($null -ne $cId) -and ([string]$cId -ne '')) {
+                    $key = [string]$cId
+                    if (-not $seen.ContainsKey($key)) {
+                        $seen[$key] = $true
+                        $ids += $key
+                        if ($ids.Count -ge $Cap) { break }
+                    }
+                }
+            }
+
+            Write-Host ('    Page ' + $pageNumber + ': +' + $convArr.Count + ' rows (unique so far: ' + $ids.Count + ')')
+            if ($convArr.Count -lt 100) { break }   # short page = last page
+        }
+
+        $windowEnd = $windowStart
+    }
+
+    if ($ids.Count -ge $Cap) {
+        Write-Warning ('Hit -MaxConversations cap (' + $Cap + '); older conversations in the range were not fetched. Raise -MaxConversations or narrow the date range.')
+    }
+    return ,$ids
+}
+
+# ---------------------------------------------------------------------------
 # Fetch every suggestion page for one conversation.
 # Handles both nextUri-style and cursor ("after") style pagination.
 # ---------------------------------------------------------------------------
@@ -487,6 +624,11 @@ if (($AccessToken -eq '') -and (($ClientId -eq '') -or ($ClientSecret -eq ''))) 
     throw 'Provide either -AccessToken, or both -ClientId and -ClientSecret.'
 }
 
+$explicitIds = (@($ConversationId).Count -gt 0)
+if ((-not $explicitIds) -and ($DivisionId -eq '')) {
+    throw 'Provide -DivisionId to discover conversations dynamically, or -ConversationId for explicit conversations.'
+}
+
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 if ($OutputCsv -eq '') { $OutputCsv = '.\GcSuggestions_' + $timestamp + '.csv' }
 $retrievedAtUtc = [string](Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -501,21 +643,41 @@ $apiHeaders = @{
     'Accept'        = 'application/json'
 }
 
+# --- Build the target conversation list -----------------------------------
+$targetIds = @()
+if ($explicitIds) {
+    foreach ($convId in $ConversationId) {
+        $cid = ([string]$convId).Trim()
+        if ($cid -ne '') { $targetIds += $cid }
+    }
+}
+else {
+    Write-Host ''
+    Write-Host ('Discovering conversations in division ' + $DivisionId + ' from ' + $StartDate.ToString('yyyy-MM-dd HH:mm') + ' to ' + $EndDate.ToString('yyyy-MM-dd HH:mm') + ' ...')
+    $targetIds = Get-GcConversationIdsByDivision -ApiBase $apiBase -Headers $apiHeaders -DivId $DivisionId -From $StartDate -To $EndDate -Cap $MaxConversations
+    Write-Host ('Conversations discovered: ' + $targetIds.Count)
+    if ($targetIds.Count -eq 0) {
+        Write-Host 'No conversations found in that division/date range - nothing to do.'
+        return
+    }
+}
+
+# --- Pull suggestions per conversation -------------------------------------
 $rows           = @()
 $rawSuggestions = @()
 $okCount        = 0
 $skipCount      = 0
+$noSuggCount    = 0
 $failCount      = 0
 
-foreach ($convId in $ConversationId) {
-    $cid = ([string]$convId).Trim()
-    if ($cid -eq '') { continue }
-
+foreach ($cid in $targetIds) {
     Write-Host ''
     Write-Host ('Conversation: ' + $cid)
 
     try {
-        if ($DivisionId -ne '') {
+        # Division guard only applies to explicit IDs - discovered ones were
+        # already filtered on divisionId by the analytics query itself.
+        if ($explicitIds -and ($DivisionId -ne '')) {
             $inDivision = Test-GcConversationDivision -ApiBase $apiBase -Headers $apiHeaders -ConvId $cid -ExpectedDivisionId $DivisionId
             if (-not $inDivision) {
                 $skipCount++
@@ -533,15 +695,24 @@ foreach ($convId in $ConversationId) {
         $okCount++
     }
     catch {
-        $failCount++
         $emsg = ''
         try { $emsg = [string]$_.Exception.Message } catch { $emsg = 'unknown error' }
-        Write-Warning ('Conversation ' + $cid + ' failed: ' + $emsg)
+
+        # In discovery mode many conversations never had Agent Copilot active;
+        # the suggestions endpoint answers 404 for those. Treat as "none".
+        if ($emsg -like '*404*') {
+            $noSuggCount++
+            Write-Host '  No suggestions available for this conversation (404).'
+        }
+        else {
+            $failCount++
+            Write-Warning ('Conversation ' + $cid + ' failed: ' + $emsg)
+        }
     }
 }
 
 Write-Host ''
-Write-Host ('Done. Conversations OK: ' + $okCount + '  skipped (division): ' + $skipCount + '  failed: ' + $failCount + '  total suggestions: ' + $rows.Count)
+Write-Host ('Done. Conversations OK: ' + $okCount + '  without suggestions (404): ' + $noSuggCount + '  skipped (division): ' + $skipCount + '  failed: ' + $failCount + '  total suggestions: ' + $rows.Count)
 
 if ($rows.Count -gt 0) {
     # Explicit column order (New-Object -Property hashtables do not preserve it).

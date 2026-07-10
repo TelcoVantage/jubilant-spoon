@@ -1,13 +1,39 @@
 <#
 .SYNOPSIS
-    Retrieves Agent Copilot suggestions for a Genesys Cloud conversation:
-        GET /api/v2/conversations/{conversationId}/suggestions
+    Genesys Cloud Agent Copilot report exporter (Power BI friendly).
+
+    Inspired by the GenesysCloudBlueprints/copilot-conversation-inspector
+    blueprint, but PowerShell-only: no UI, just clean relational CSVs.
 
 .DESCRIPTION
-    Designed for Windows PowerShell 5.1 running in CONSTRAINED LANGUAGE MODE
+    For every conversation (explicit IDs, or discovered dynamically from a
+    division ID) the script calls:
+
+        GET  /api/v2/conversations/{conversationId}/suggestions   (Agent Copilot suggestions)
+        GET  /api/v2/conversations/{conversationId}/summaries     (Copilot session summaries)
+        POST /api/v2/analytics/conversations/details/query        (discovery mode only)
+
+    and writes a report FOLDER containing flat, star-schema style CSVs that
+    load straight into Power BI (relate the child tables on ConversationId /
+    SuggestionId):
+
+        Conversations.csv       1 row per conversation  (dates, media, queue,
+                                customer, suggestion/summary counts)
+        Suggestions.csv         1 row per Copilot suggestion, fully flattened
+                                (type, state, trigger, confidence, article
+                                link, extracted answer, context)
+        SuggestionSnippets.csv  1 row per knowledge snippet (a suggestion can
+                                carry several) - child of Suggestions.csv
+        Summaries.csv           1 row per Copilot session summary (summary
+                                text, reason, resolution, follow-up, wrap-ups)
+
+    No embedded JSON blobs in any CSV column. Add -RawJson if you also want
+    the untouched API payloads saved alongside for debugging.
+
+    Designed for Windows PowerShell 5.1 in CONSTRAINED LANGUAGE MODE
     (AppLocker / WDAC locked-down endpoints). The entire script is CLM-safe:
 
-      * No .NET static method calls  (no [Convert]::, [Text.Encoding]::, [uri]::, [Guid]::)
+      * No .NET static method calls  (no [Convert]::, [Text.Encoding]::, [uri]::, [math]::)
       * No ::new() constructors      (plain arrays with += instead)
       * No [pscustomobject]@{} casts (New-Object PSObject -Property @{} instead,
                                       with explicit Select-Object column ordering)
@@ -17,94 +43,73 @@
         try/catch, with fallback string matching on $_.Exception.Message.
       * Every API response is validated explicitly before being used.
 
-    Authentication uses the OAuth Client Credentials grant. The OAuth client's
-    role must be assigned to the division that owns the conversation (the
-    conversation IDs you pass come from a single division), and the role needs
-    the Agent Copilot / suggestions view permission (e.g. assistants > suggestion
-    > view, or conversation view depending on your org's permission model).
-
     TLS NOTE: CLM blocks setting [Net.ServicePointManager]::SecurityProtocol.
-    On a current Windows 10/11 or Server 2019+ endpoint TLS 1.2 is negotiated by
-    default. If you hit "Could not create SSL/TLS secure channel", enable strong
-    crypto machine-wide via registry (SystemDefaultTlsVersions /
-    SchUseStrongCrypto) - that is an admin/GPO change, not a script change.
+    On a current Windows 10/11 or Server 2019+ endpoint TLS 1.2 is negotiated
+    by default. If you hit "Could not create SSL/TLS secure channel", enable
+    strong crypto machine-wide via registry (SystemDefaultTlsVersions /
+    SchUseStrongCrypto) - an admin/GPO change, not a script change.
 
 .PARAMETER Region
     Genesys Cloud region domain (NOT the full URL). Defaults to the embedded
-    value 'mypurecloud.com.au' (Australia / Sydney). Other examples:
-      mypurecloud.com  mypurecloud.ie  mypurecloud.de  mypurecloud.jp
-      usw2.pure.cloud  cac1.pure.cloud  euw2.pure.cloud  euc2.pure.cloud
-      aps1.pure.cloud  apne2.pure.cloud  sae1.pure.cloud  mec1.pure.cloud
+    value 'mypurecloud.com.au' (Australia / Sydney).
 
 .PARAMETER ClientId
     OAuth client ID (Client Credentials grant). Defaults to the embedded
     $EmbeddedClientId value in the configuration block below.
 
 .PARAMETER ClientSecret
-    OAuth client secret. Defaults to the embedded $EmbeddedClientSecret value
-    in the configuration block below.
+    OAuth client secret. Defaults to the embedded $EmbeddedClientSecret value.
 
 .PARAMETER AccessToken
-    Optional. Supply an existing bearer token to skip the token request
-    (ClientId/ClientSecret are then ignored).
+    Optional. Supply an existing bearer token to skip the token request.
 
 .PARAMETER ConversationId
-    Optional. One or more explicit conversation IDs (all from the same
-    division). When omitted, supply -DivisionId instead and the script
-    discovers the conversation IDs dynamically.
+    Optional. Explicit conversation IDs. When omitted, supply -DivisionId and
+    the script discovers conversations dynamically.
 
 .PARAMETER DivisionId
-    The division ID to work with. Two behaviors:
-      * -ConversationId OMITTED: conversation IDs are discovered dynamically
-        for this division via POST /api/v2/analytics/conversations/details/query
-        (filtered on the divisionId dimension, newest first, within
-        -StartDate/-EndDate). Requires the analytics conversationDetail view
-        permission on the OAuth client's role.
-      * -ConversationId SUPPLIED: acts as a guard - each conversation is
-        fetched from GET /api/v2/conversations/{id} and its division verified;
-        mismatches are skipped with a warning.
+    The division to work with. Alone -> discovery mode (analytics details
+    query filtered on the divisionId conversation dimension, newest first).
+    Combined with -ConversationId -> division guard on each conversation.
 
 .PARAMETER StartDate
-    Discovery-mode only: start of the conversation search window
-    (default: 7 days ago). Ranges longer than 7 days are automatically
-    split into 7-day analytics queries.
+    Discovery window start (default: 7 days ago). Windows longer than the
+    analytics API's 7-day interval limit are chunked automatically.
 
 .PARAMETER EndDate
-    Discovery-mode only: end of the conversation search window (default: now).
+    Discovery window end (default: now).
 
 .PARAMETER MaxConversations
-    Discovery-mode only: safety cap on how many conversations are pulled from
-    analytics before fetching suggestions (default 500, newest first).
+    Discovery cap, newest first (default 500).
 
 .PARAMETER PageSize
-    Suggestions page size (default 100).
+    Suggestions page size (default 200, same as the blueprint app).
 
-.PARAMETER OutputCsv
-    Path of the CSV export. Default: .\GcSuggestions_<timestamp>.csv
+.PARAMETER OutputFolder
+    Report folder to create/write. Default: .\GcCopilotReport_<timestamp>
 
-.PARAMETER OutputJson
-    Optional path; when supplied the raw suggestion objects are also written
-    as pretty-printed JSON for full-fidelity inspection.
+.PARAMETER SkipSummaries
+    Skip the per-conversation summaries call (faster; Summaries.csv omitted).
 
-.EXAMPLE
-    # DISCOVERY MODE: give it a division ID, it finds the conversations itself
-    # (last 7 days by default) and pulls suggestions for each.
-    .\Get-GcConversationSuggestions.ps1 `
-        -DivisionId '11111111-2222-3333-4444-555555555555'
+.PARAMETER RawJson
+    Also write RawSuggestions.json / RawSummaries.json into the report folder.
 
 .EXAMPLE
-    # Discovery over a custom window with a bigger cap and both exports
+    # Discovery mode: last 7 days of one division, full report folder
+    .\Get-GcConversationSuggestions.ps1 -DivisionId '11111111-2222-3333-4444-555555555555'
+
+.EXAMPLE
+    # 30-day window, bigger cap, custom folder for the Power BI refresh
     .\Get-GcConversationSuggestions.ps1 `
         -DivisionId '11111111-2222-3333-4444-555555555555' `
-        -StartDate (Get-Date).AddDays(-30) -EndDate (Get-Date) `
+        -StartDate (Get-Date).AddDays(-30) `
         -MaxConversations 2000 `
-        -OutputCsv C:\Reports\suggestions.csv `
-        -OutputJson C:\Reports\suggestions.json
+        -OutputFolder 'C:\Reports\CopilotWeekly'
 
 .EXAMPLE
-    # Explicit conversation ID (embedded region + credentials)
+    # Explicit conversation IDs, suggestions only (no summaries)
     .\Get-GcConversationSuggestions.ps1 `
-        -ConversationId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+        -ConversationId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee' -SkipSummaries
 #>
 
 [CmdletBinding()]
@@ -139,13 +144,16 @@ param(
 
     [Parameter(Mandatory = $false)]
     [ValidateRange(1, 500)]
-    [int]$PageSize = 100,
+    [int]$PageSize = 200,
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputCsv = '',
+    [string]$OutputFolder = '',
 
     [Parameter(Mandatory = $false)]
-    [string]$OutputJson = ''
+    [switch]$SkipSummaries,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$RawJson
 )
 
 $ErrorActionPreference = 'Stop'
@@ -157,7 +165,7 @@ $ErrorActionPreference = 'Stop'
 #
 # SECURITY: anyone who can read this file can read these credentials. Restrict
 # NTFS permissions on the script and scope the OAuth client's role to the
-# minimum permissions (suggestions view) in the one division you query.
+# minimum permissions in the one division you query.
 # ===========================================================================
 $EmbeddedRegion       = 'mypurecloud.com.au'
 $EmbeddedClientId     = 'PASTE-YOUR-CLIENT-ID-HERE'
@@ -249,6 +257,40 @@ function Get-Prop {
     return $p.Value
 }
 
+# Reads the first non-empty property among $Names - handy for the legacy /
+# alternate payload shapes the blueprint also tolerates.
+function Get-FirstProp {
+    param($InputObject, [string[]]$Names)
+
+    foreach ($n in $Names) {
+        $v = Get-Prop -InputObject $InputObject -Name $n
+        if (($null -ne $v) -and ([string]$v -ne '')) { return $v }
+    }
+    return $null
+}
+
+# Summaries use "confidence fields": either a plain string, or an object with
+# text/value/content + description + confidence + outcome. Flatten safely.
+function Get-CFText {
+    param($Field)
+
+    if ($null -eq $Field) { return '' }
+    if ($Field -is [string]) { return $Field }
+    $v = Get-FirstProp -InputObject $Field -Names @('text', 'value', 'content')
+    if ($null -ne $v) { return [string]$v }
+    return ''
+}
+
+function Get-CFDetail {
+    param($Field, [string]$Name)
+
+    if ($null -eq $Field) { return '' }
+    if ($Field -is [string]) { return '' }
+    $v = Get-Prop -InputObject $Field -Name $Name
+    if ($null -ne $v) { return [string]$v }
+    return ''
+}
+
 # ---------------------------------------------------------------------------
 # HTTP status extraction per the CLM error-handling pattern:
 # [int]$_.Exception.Response.StatusCode in try/catch, then message fallback.
@@ -318,7 +360,7 @@ function Invoke-GcApi {
             if     ($status -eq 400) { throw ('Bad request (400). The API rejected the request body/parameters. ' + $detail + ' URI: ' + $Uri) }
             elseif ($status -eq 401) { throw ('API call unauthorized (401). Token expired or invalid. URI: ' + $Uri) }
             elseif ($status -eq 403) { throw ('API call forbidden (403). Check the OAuth client role has the required permission AND is assigned to the division. ' + $apiBody + ' URI: ' + $Uri) }
-            elseif ($status -eq 404) { throw ('Resource not found (404). Check the conversation ID and region. URI: ' + $Uri) }
+            elseif ($status -eq 404) { throw ('Resource not found (404). URI: ' + $Uri) }
             elseif ($status -gt 0)   { throw ('API call failed (HTTP ' + $status + '): ' + $detail + ' URI: ' + $Uri) }
             else                     { throw ('API call failed (network/unknown): ' + $detail + ' URI: ' + $Uri) }
         }
@@ -398,13 +440,16 @@ function Test-GcConversationDivision {
 }
 
 # ---------------------------------------------------------------------------
-# Discovery mode: find conversation IDs in a division dynamically via
+# Discovery mode: find conversations in a division dynamically via
 # POST /api/v2/analytics/conversations/details/query, filtered on the
-# divisionId dimension, newest first. The analytics API caps a single query
-# interval at 7 days and a page at 100 rows, so wider date ranges are split
-# into 7-day windows and each window is paged until exhausted.
+# divisionId CONVERSATION dimension (conversationFilters), newest first.
+# The analytics API caps a single query interval at 7 days and a page at
+# 100 rows, so wider ranges are split into 7-day windows and paged.
+#
+# Returns rich objects (id + start/end + media + queue + customer) so
+# Conversations.csv carries useful reporting columns, not just IDs.
 # ---------------------------------------------------------------------------
-function Get-GcConversationIdsByDivision {
+function Get-GcConversationsByDivision {
     param(
         [Parameter(Mandatory = $true)][string]$ApiBase,
         [Parameter(Mandatory = $true)][hashtable]$Headers,
@@ -418,14 +463,14 @@ function Get-GcConversationIdsByDivision {
         throw ('-StartDate (' + [string]$From + ') must be earlier than -EndDate (' + [string]$To + ').')
     }
 
-    $ids  = @()
-    $seen = @{}   # de-dupe: a conversation can span analytics windows
+    $found = @()
+    $seen  = @{}   # de-dupe: a conversation can span analytics windows
 
     # Walk BACKWARD from -EndDate in 7-day windows so "newest first" holds
     # across windows, not just inside one - the cap then keeps the most
     # recent conversations.
     $windowEnd = $To
-    while (($windowEnd -gt $From) -and ($ids.Count -lt $Cap)) {
+    while (($windowEnd -gt $From) -and ($found.Count -lt $Cap)) {
         $windowStart = $windowEnd.AddDays(-7)
         if ($windowStart -lt $From) { $windowStart = $From }
 
@@ -435,12 +480,11 @@ function Get-GcConversationIdsByDivision {
 
         $pageNumber = 0
         $maxPagesPerWindow = 100
-        while (($pageNumber -lt $maxPagesPerWindow) -and ($ids.Count -lt $Cap)) {
+        while (($pageNumber -lt $maxPagesPerWindow) -and ($found.Count -lt $Cap)) {
             $pageNumber++
 
             # divisionId is a CONVERSATION-level dimension, so the predicate
-            # must live in conversationFilters - putting it in segmentFilters
-            # makes the API reject the query with HTTP 400.
+            # lives in conversationFilters (segmentFilters -> HTTP 400).
             $queryBody = @{
                 interval            = $interval
                 order               = 'desc'
@@ -478,27 +522,60 @@ function Get-GcConversationIdsByDivision {
 
             foreach ($c in $convArr) {
                 $cId = Get-Prop -InputObject $c -Name 'conversationId'
-                if (($null -ne $cId) -and ([string]$cId -ne '')) {
-                    $key = [string]$cId
-                    if (-not $seen.ContainsKey($key)) {
-                        $seen[$key] = $true
-                        $ids += $key
-                        if ($ids.Count -ge $Cap) { break }
+                if (($null -eq $cId) -or ([string]$cId -eq '')) { continue }
+                $key = [string]$cId
+                if ($seen.ContainsKey($key)) { continue }
+                $seen[$key] = $true
+
+                # --- Flatten reporting metadata from the analytics record ---
+                $mediaTypes   = @()
+                $customerName = ''
+                $queueName    = ''
+                $participants = Get-Prop -InputObject $c -Name 'participants'
+                if ($null -ne $participants) {
+                    foreach ($p in @($participants)) {
+                        $purpose = [string](Get-Prop -InputObject $p -Name 'purpose')
+                        $pName   = [string](Get-Prop -InputObject $p -Name 'participantName')
+
+                        if (($customerName -eq '') -and (($purpose -eq 'customer') -or ($purpose -eq 'external'))) {
+                            $customerName = $pName
+                        }
+                        if (($queueName -eq '') -and ($purpose -eq 'acd')) {
+                            $queueName = $pName
+                        }
+
+                        $sessions = Get-Prop -InputObject $p -Name 'sessions'
+                        if ($null -ne $sessions) {
+                            foreach ($s in @($sessions)) {
+                                $mt = [string](Get-Prop -InputObject $s -Name 'mediaType')
+                                if (($mt -ne '') -and (-not ($mediaTypes -contains $mt))) { $mediaTypes += $mt }
+                            }
+                        }
                     }
                 }
+
+                $found += New-Object PSObject -Property @{
+                    ConversationId    = $key
+                    ConversationStart = [string](Get-Prop -InputObject $c -Name 'conversationStart')
+                    ConversationEnd   = [string](Get-Prop -InputObject $c -Name 'conversationEnd')
+                    MediaTypes        = ($mediaTypes -join ';')
+                    QueueName         = $queueName
+                    CustomerName      = $customerName
+                }
+                if ($found.Count -ge $Cap) { break }
             }
 
-            Write-Host ('    Page ' + $pageNumber + ': +' + $convArr.Count + ' rows (unique so far: ' + $ids.Count + ')')
+            Write-Host ('    Page ' + $pageNumber + ': +' + $convArr.Count + ' rows (unique so far: ' + $found.Count + ')')
             if ($convArr.Count -lt 100) { break }   # short page = last page
         }
 
         $windowEnd = $windowStart
     }
 
-    if ($ids.Count -ge $Cap) {
+    if ($found.Count -ge $Cap) {
         Write-Warning ('Hit -MaxConversations cap (' + $Cap + '); older conversations in the range were not fetched. Raise -MaxConversations or narrow the date range.')
     }
-    return ,$ids
+    return ,$found
 }
 
 # ---------------------------------------------------------------------------
@@ -510,7 +587,7 @@ function Get-GcConversationSuggestions {
         [Parameter(Mandatory = $true)][string]$ApiBase,
         [Parameter(Mandatory = $true)][hashtable]$Headers,
         [Parameter(Mandatory = $true)][string]$ConvId,
-        [int]$Size = 100
+        [int]$Size = 200
     )
 
     $all = @()
@@ -521,15 +598,13 @@ function Get-GcConversationSuggestions {
 
     while (($uri -ne '') -and ($page -lt $maxPages)) {
         $page++
-        Write-Host ('  Page ' + $page + ' -> ' + $uri)
         $resp = Invoke-GcApi -Uri $uri -Headers $Headers
 
-        if ($null -eq $resp) {
-            Write-Warning ('Conversation ' + $ConvId + ': empty response on page ' + $page + '.')
-            break
-        }
+        if ($null -eq $resp) { break }
 
+        # Current payloads use 'entities'; some older shapes used 'suggestions'.
         $entities = Get-Prop -InputObject $resp -Name 'entities'
+        if ($null -eq $entities) { $entities = Get-Prop -InputObject $resp -Name 'suggestions' }
         if ($null -ne $entities) {
             foreach ($e in @($entities)) {
                 if ($null -ne $e) { $all += $e }
@@ -566,67 +641,213 @@ function Get-GcConversationSuggestions {
 }
 
 # ---------------------------------------------------------------------------
-# Flatten one suggestion entity into a CSV-friendly row.
-# The Suggestion model nests its payload under a type-specific container
-# (knowledgeArticle / knowledgeAnswer / cannedResponse / script), so each
-# container is probed defensively - unknown future types still land in RawJson.
+# Fetch Copilot session summaries for one conversation.
+# Current shape: { sessionSummaries: [...] }; older shapes used entities /
+# summaries arrays - all tolerated, same as the blueprint app.
+# ---------------------------------------------------------------------------
+function Get-GcConversationSummaries {
+    param(
+        [Parameter(Mandatory = $true)][string]$ApiBase,
+        [Parameter(Mandatory = $true)][hashtable]$Headers,
+        [Parameter(Mandatory = $true)][string]$ConvId
+    )
+
+    $resp = Invoke-GcApi -Uri ($ApiBase + '/api/v2/conversations/' + $ConvId + '/summaries') -Headers $Headers
+    if ($null -eq $resp) { return ,@() }
+
+    $entries = Get-Prop -InputObject $resp -Name 'sessionSummaries'
+    if ($null -eq $entries) { $entries = Get-Prop -InputObject $resp -Name 'entities' }
+    if ($null -eq $entries) { $entries = Get-Prop -InputObject $resp -Name 'summaries' }
+
+    $all = @()
+    if ($null -ne $entries) {
+        foreach ($e in @($entries)) {
+            if ($null -ne $e) { $all += $e }
+        }
+    }
+    return ,$all
+}
+
+# ---------------------------------------------------------------------------
+# Flatten one suggestion into a clean row + snippet child rows.
+# Field layout follows the blueprint's SuggestionEntry model: current shape
+# (knowledgeSearch payload + context) with the legacy fallbacks it also keeps.
+# Returns a hashtable: @{ Row = <PSObject>; Snippets = <PSObject[]> }
 # ---------------------------------------------------------------------------
 function ConvertTo-SuggestionRow {
     param(
         [Parameter(Mandatory = $true)][string]$ConvId,
         [Parameter(Mandatory = $true)]$Suggestion,
-        [Parameter(Mandatory = $true)][string]$RetrievedAtUtc
+        [Parameter(Mandatory = $true)][string]$RegionDomain
     )
 
-    $resourceId      = ''
-    $resourceTitle   = ''
-    $knowledgeBaseId = ''
+    $suggId = [string](Get-Prop -InputObject $Suggestion -Name 'id')
 
-    foreach ($containerName in @('knowledgeArticle', 'knowledgeAnswer', 'knowledgeSearch', 'cannedResponse', 'script')) {
-        $container = Get-Prop -InputObject $Suggestion -Name $containerName
-        if ($null -eq $container) { continue }
+    $ks      = Get-Prop -InputObject $Suggestion -Name 'knowledgeSearch'
+    $context = Get-Prop -InputObject $Suggestion -Name 'context'
 
-        $v = Get-Prop -InputObject $container -Name 'id'
-        if (($null -ne $v) -and ($resourceId -eq '')) { $resourceId = [string]$v }
-
-        foreach ($titleProp in @('title', 'name')) {
-            $v = Get-Prop -InputObject $container -Name $titleProp
-            if (($null -ne $v) -and ($resourceTitle -eq '')) { $resourceTitle = [string]$v }
-        }
-
-        $kb = Get-Prop -InputObject $container -Name 'knowledgeBase'
-        $v  = Get-Prop -InputObject $kb -Name 'id'
-        if (($null -ne $v) -and ($knowledgeBaseId -eq '')) { $knowledgeBaseId = [string]$v }
-
-        # Some payloads nest the document one level deeper (e.g. .article / .document)
-        foreach ($innerName in @('article', 'document')) {
-            $inner = Get-Prop -InputObject $container -Name $innerName
-            if ($null -eq $inner) { continue }
-            $v = Get-Prop -InputObject $inner -Name 'id'
-            if (($null -ne $v) -and ($resourceId -eq '')) { $resourceId = [string]$v }
-            $v = Get-Prop -InputObject $inner -Name 'title'
-            if (($null -ne $v) -and ($resourceTitle -eq '')) { $resourceTitle = [string]$v }
-        }
+    # --- Title: current shape first, then every legacy container ---
+    $title = [string](Get-FirstProp -InputObject $ks -Names @('title'))
+    if ($title -eq '') {
+        $ka = Get-Prop -InputObject $Suggestion -Name 'knowledgeArticle'
+        $title = [string](Get-FirstProp -InputObject $ka -Names @('title'))
+    }
+    if ($title -eq '') {
+        $sg = Get-Prop -InputObject $Suggestion -Name 'suggestion'
+        $title = [string](Get-FirstProp -InputObject $sg -Names @('title'))
+    }
+    if ($title -eq '') {
+        $cr = Get-Prop -InputObject $Suggestion -Name 'cannedResponse'
+        $title = [string](Get-FirstProp -InputObject $cr -Names @('name'))
+    }
+    if ($title -eq '') {
+        $sc = Get-Prop -InputObject $Suggestion -Name 'script'
+        $title = [string](Get-FirstProp -InputObject $sc -Names @('name'))
+    }
+    if ($title -eq '') {
+        $title = [string](Get-FirstProp -InputObject $Suggestion -Names @('title', 'name'))
     }
 
-    $confidence = Get-Prop -InputObject $Suggestion -Name 'confidence'
+    # --- Extracted answer (the highlighted passage Copilot surfaced) ---
+    $answerText = ''
+    $kAnswer = Get-Prop -InputObject $ks -Name 'knowledgeAnswer'
+    if ($null -ne $kAnswer) { $answerText = [string](Get-FirstProp -InputObject $kAnswer -Names @('answer')) }
+    if ($answerText -eq '') {
+        $ans = Get-Prop -InputObject $Suggestion -Name 'answer'
+        $answerText = [string](Get-FirstProp -InputObject $ans -Names @('text'))
+    }
+    if ($answerText -eq '') {
+        $answerText = [string](Get-FirstProp -InputObject $Suggestion -Names @('snippet', 'body'))
+    }
+
+    # --- Confidence: numeric 0..1 so Power BI can aggregate/format it ---
+    $confidence = Get-Prop -InputObject $ks -Name 'confidence'
+    if ($null -eq $confidence) { $confidence = Get-Prop -InputObject $Suggestion -Name 'confidence' }
     $confidenceStr = ''
     if ($null -ne $confidence) { $confidenceStr = [string]$confidence }
 
-    # CLM-safe object creation (no [pscustomobject] cast). Column order is NOT
-    # preserved by -Property hashtables; Select-Object downstream fixes that.
+    # --- Knowledge document + Workbench deep-link (same URL scheme as the
+    #     blueprint's getKnowledgeArticleUrl helper) ---
+    $documentId      = ''
+    $knowledgeBaseId = ''
+    $articleUrl      = ''
+    $doc = Get-Prop -InputObject $ks -Name 'document'
+    if ($null -ne $doc) {
+        $documentId = [string](Get-Prop -InputObject $doc -Name 'id')
+        $selfUri    = [string](Get-Prop -InputObject $doc -Name 'selfUri')
+        if ($selfUri -match '/knowledgebases/([^/]+)/documents/([^/?#]+)') {
+            $knowledgeBaseId = [string]$Matches[1]
+            $articleUrl = 'https://apps.' + $RegionDomain + '/directory/#/admin/knowledge/v2/knowledge-bases/' + $Matches[1] + '/articles/' + $Matches[2]
+        }
+    }
+
+    # --- Context: where/for whom Copilot raised the suggestion ---
+    $queueId = ''; $agentUserId = ''; $mediaType = ''; $externalContactId = ''
+    if ($null -ne $context) {
+        $q = Get-Prop -InputObject $context -Name 'queue'
+        $queueId = [string](Get-FirstProp -InputObject $q -Names @('id'))
+        $u = Get-Prop -InputObject $context -Name 'user'
+        $agentUserId = [string](Get-FirstProp -InputObject $u -Names @('id'))
+        $mediaType = [string](Get-FirstProp -InputObject $context -Names @('mediaType'))
+        $ec = Get-Prop -InputObject $context -Name 'externalContact'
+        $externalContactId = [string](Get-FirstProp -InputObject $ec -Names @('id'))
+    }
+
+    $row = New-Object PSObject -Property @{
+        ConversationId    = $ConvId
+        SuggestionId      = $suggId
+        SuggestionType    = [string](Get-Prop -InputObject $Suggestion -Name 'type')
+        State             = [string](Get-Prop -InputObject $Suggestion -Name 'state')
+        TriggerType       = [string](Get-Prop -InputObject $Suggestion -Name 'triggerType')
+        DateCreated       = [string](Get-FirstProp -InputObject $Suggestion -Names @('dateCreated', 'dateIssued'))
+        Confidence        = $confidenceStr
+        Title             = $title
+        AnswerText        = $answerText
+        DocumentId        = $documentId
+        KnowledgeBaseId   = $knowledgeBaseId
+        ArticleUrl        = $articleUrl
+        SearchId          = [string](Get-FirstProp -InputObject $ks -Names @('searchId'))
+        MediaType         = $mediaType
+        QueueId           = $queueId
+        AgentUserId       = $agentUserId
+        ExternalContactId = $externalContactId
+    }
+
+    # --- Snippets: one child row each (a suggestion can carry several) ---
+    $snippetRows = @()
+    $snips = Get-Prop -InputObject $ks -Name 'snippets'
+    if ($null -ne $snips) {
+        $ix = 0
+        foreach ($sn in @($snips)) {
+            if ($null -eq $sn) { continue }
+            $ix++
+            $snippetRows += New-Object PSObject -Property @{
+                ConversationId = $ConvId
+                SuggestionId   = $suggId
+                SnippetIndex   = $ix
+                SnippetText    = [string]$sn
+            }
+        }
+    }
+
+    return @{ Row = $row; Snippets = $snippetRows }
+}
+
+# ---------------------------------------------------------------------------
+# Flatten one Copilot session summary into a clean row.
+# ---------------------------------------------------------------------------
+function ConvertTo-SummaryRow {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConvId,
+        [Parameter(Mandatory = $true)]$Summary
+    )
+
+    $reason     = Get-Prop -InputObject $Summary -Name 'reason'
+    $resolution = Get-Prop -InputObject $Summary -Name 'resolution'
+    $followup   = Get-Prop -InputObject $Summary -Name 'followup'
+
+    # Summary text: current shape has it at top level; legacy under .summary
+    $text = [string](Get-FirstProp -InputObject $Summary -Names @('text'))
+    if ($text -eq '') {
+        $legacy = Get-Prop -InputObject $Summary -Name 'summary'
+        $text = Get-CFText -Field $legacy
+    }
+
+    # Predicted wrap-up codes: join names for a single tidy column
+    $wrapups = @()
+    $pwc = Get-Prop -InputObject $Summary -Name 'predictedWrapupCodes'
+    if ($null -ne $pwc) {
+        foreach ($w in @($pwc)) {
+            $wName = [string](Get-FirstProp -InputObject $w -Names @('name', 'id'))
+            if ($wName -ne '') { $wrapups += $wName }
+        }
+    }
+    $suggested = Get-Prop -InputObject $Summary -Name 'suggestedWrapUpCode'
+    if ($null -ne $suggested) {
+        $wName = [string](Get-FirstProp -InputObject $suggested -Names @('name'))
+        if (($wName -ne '') -and (-not ($wrapups -contains $wName))) { $wrapups += $wName }
+    }
+
+    $confidence = Get-Prop -InputObject $Summary -Name 'confidence'
+    $confidenceStr = ''
+    if ($null -ne $confidence) { $confidenceStr = [string]$confidence }
+
     return New-Object PSObject -Property @{
-        ConversationId  = $ConvId
-        SuggestionId    = [string](Get-Prop -InputObject $Suggestion -Name 'id')
-        SuggestionType  = [string](Get-Prop -InputObject $Suggestion -Name 'type')
-        State           = [string](Get-Prop -InputObject $Suggestion -Name 'state')
-        DateIssued      = [string](Get-Prop -InputObject $Suggestion -Name 'dateIssued')
-        Confidence      = $confidenceStr
-        ResourceId      = $resourceId
-        ResourceTitle   = $resourceTitle
-        KnowledgeBaseId = $knowledgeBaseId
-        RetrievedAtUtc  = $RetrievedAtUtc
-        RawJson         = (ConvertTo-Json -InputObject $Suggestion -Depth 15 -Compress)
+        ConversationId        = $ConvId
+        SummaryId             = [string](Get-Prop -InputObject $Summary -Name 'id')
+        MediaType             = [string](Get-Prop -InputObject $Summary -Name 'mediaType')
+        Language              = [string](Get-Prop -InputObject $Summary -Name 'language')
+        Status                = [string](Get-Prop -InputObject $Summary -Name 'status')
+        SummaryText           = $text
+        Confidence            = $confidenceStr
+        ReasonText            = (Get-CFText -Field $reason)
+        ReasonDescription     = (Get-CFDetail -Field $reason -Name 'description')
+        ResolutionText        = (Get-CFText -Field $resolution)
+        ResolutionDescription = (Get-CFDetail -Field $resolution -Name 'description')
+        ResolutionOutcome     = (Get-CFDetail -Field $resolution -Name 'outcome')
+        FollowupText          = (Get-CFText -Field $followup)
+        FollowupDescription   = (Get-CFDetail -Field $followup -Name 'description')
+        PredictedWrapupCodes  = ($wrapups -join ';')
     }
 }
 
@@ -644,8 +865,8 @@ if ((-not $explicitIds) -and ($DivisionId -eq '')) {
 }
 
 $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-if ($OutputCsv -eq '') { $OutputCsv = '.\GcSuggestions_' + $timestamp + '.csv' }
-$retrievedAtUtc = [string](Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+if ($OutputFolder -eq '') { $OutputFolder = '.\GcCopilotReport_' + $timestamp }
+$null = New-Item -ItemType Directory -Path $OutputFolder -Force
 
 $token = $AccessToken
 if ($token -eq '') {
@@ -657,36 +878,52 @@ $apiHeaders = @{
     'Accept'        = 'application/json'
 }
 
-# --- Build the target conversation list -----------------------------------
-$targetIds = @()
+# --- Build the target conversation list (rich objects) ---------------------
+$targets = @()
 if ($explicitIds) {
     foreach ($convId in $ConversationId) {
         $cid = ([string]$convId).Trim()
-        if ($cid -ne '') { $targetIds += $cid }
+        if ($cid -eq '') { continue }
+        $targets += New-Object PSObject -Property @{
+            ConversationId    = $cid
+            ConversationStart = ''
+            ConversationEnd   = ''
+            MediaTypes        = ''
+            QueueName         = ''
+            CustomerName      = ''
+        }
     }
 }
 else {
     Write-Host ''
     Write-Host ('Discovering conversations in division ' + $DivisionId + ' from ' + $StartDate.ToString('yyyy-MM-dd HH:mm') + ' to ' + $EndDate.ToString('yyyy-MM-dd HH:mm') + ' ...')
-    $targetIds = Get-GcConversationIdsByDivision -ApiBase $apiBase -Headers $apiHeaders -DivId $DivisionId -From $StartDate -To $EndDate -Cap $MaxConversations
-    Write-Host ('Conversations discovered: ' + $targetIds.Count)
-    if ($targetIds.Count -eq 0) {
+    $targets = Get-GcConversationsByDivision -ApiBase $apiBase -Headers $apiHeaders -DivId $DivisionId -From $StartDate -To $EndDate -Cap $MaxConversations
+    Write-Host ('Conversations discovered: ' + $targets.Count)
+    if ($targets.Count -eq 0) {
         Write-Host 'No conversations found in that division/date range - nothing to do.'
         return
     }
 }
 
-# --- Pull suggestions per conversation -------------------------------------
-$rows           = @()
+# --- Pull suggestions (+ summaries) per conversation ------------------------
+$suggestionRows = @()
+$snippetRows    = @()
+$summaryRows    = @()
 $rawSuggestions = @()
-$okCount        = 0
-$skipCount      = 0
-$noSuggCount    = 0
-$failCount      = 0
+$rawSummaries   = @()
+$suggCountByConv = @{}
+$summCountByConv = @{}
 
-foreach ($cid in $targetIds) {
-    Write-Host ''
-    Write-Host ('Conversation: ' + $cid)
+$okCount     = 0
+$skipCount   = 0
+$noSuggCount = 0
+$failCount   = 0
+$idx         = 0
+
+foreach ($t in $targets) {
+    $cid = [string](Get-Prop -InputObject $t -Name 'ConversationId')
+    $idx++
+    Write-Host ('[' + $idx + '/' + $targets.Count + '] Conversation ' + $cid)
 
     try {
         # Division guard only applies to explicit IDs - discovered ones were
@@ -699,49 +936,141 @@ foreach ($cid in $targetIds) {
             }
         }
 
+        # ---- Suggestions ----
         $suggestions = Get-GcConversationSuggestions -ApiBase $apiBase -Headers $apiHeaders -ConvId $cid -Size $PageSize
-        Write-Host ('  Suggestions found: ' + $suggestions.Count)
+        $suggCountByConv[$cid] = $suggestions.Count
+        if ($suggestions.Count -gt 0) {
+            Write-Host ('    Suggestions: ' + $suggestions.Count)
+        }
 
         foreach ($s in $suggestions) {
             $rawSuggestions += $s
-            $rows += ConvertTo-SuggestionRow -ConvId $cid -Suggestion $s -RetrievedAtUtc $retrievedAtUtc
+            $flat = ConvertTo-SuggestionRow -ConvId $cid -Suggestion $s -RegionDomain $Region
+            $suggestionRows += $flat.Row
+            foreach ($snRow in $flat.Snippets) { $snippetRows += $snRow }
         }
+
+        # ---- Summaries ----
+        if (-not $SkipSummaries) {
+            try {
+                $summaries = Get-GcConversationSummaries -ApiBase $apiBase -Headers $apiHeaders -ConvId $cid
+                $summCountByConv[$cid] = $summaries.Count
+                if ($summaries.Count -gt 0) {
+                    Write-Host ('    Summaries:   ' + $summaries.Count)
+                }
+                foreach ($sm in $summaries) {
+                    $rawSummaries += $sm
+                    $summaryRows += ConvertTo-SummaryRow -ConvId $cid -Summary $sm
+                }
+            }
+            catch {
+                $smsg = ''
+                try { $smsg = [string]$_.Exception.Message } catch { $smsg = '' }
+                # 404 = no Copilot summary for this conversation; anything else is worth seeing
+                if (-not ($smsg -like '*404*')) {
+                    Write-Warning ('    Summaries failed for ' + $cid + ': ' + $smsg)
+                }
+            }
+        }
+
         $okCount++
     }
     catch {
         $emsg = ''
         try { $emsg = [string]$_.Exception.Message } catch { $emsg = 'unknown error' }
 
-        # In discovery mode many conversations never had Agent Copilot active;
-        # the suggestions endpoint answers 404 for those. Treat as "none".
+        # Many conversations never had Agent Copilot active; the suggestions
+        # endpoint answers 404 for those. Treat as "none", not a failure.
         if ($emsg -like '*404*') {
             $noSuggCount++
-            Write-Host '  No suggestions available for this conversation (404).'
+            $suggCountByConv[$cid] = 0
         }
         else {
             $failCount++
-            Write-Warning ('Conversation ' + $cid + ' failed: ' + $emsg)
+            Write-Warning ('    Conversation ' + $cid + ' failed: ' + $emsg)
         }
+    }
+}
+
+# --- Stamp per-conversation counts, then export the report -----------------
+$conversationRows = @()
+foreach ($t in $targets) {
+    $cid = [string](Get-Prop -InputObject $t -Name 'ConversationId')
+    $sCount = 0
+    if ($suggCountByConv.ContainsKey($cid)) { $sCount = [int]$suggCountByConv[$cid] }
+    $smCount = 0
+    if ($summCountByConv.ContainsKey($cid)) { $smCount = [int]$summCountByConv[$cid] }
+
+    $conversationRows += New-Object PSObject -Property @{
+        ConversationId    = $cid
+        ConversationStart = [string](Get-Prop -InputObject $t -Name 'ConversationStart')
+        ConversationEnd   = [string](Get-Prop -InputObject $t -Name 'ConversationEnd')
+        MediaTypes        = [string](Get-Prop -InputObject $t -Name 'MediaTypes')
+        QueueName         = [string](Get-Prop -InputObject $t -Name 'QueueName')
+        CustomerName      = [string](Get-Prop -InputObject $t -Name 'CustomerName')
+        SuggestionCount   = $sCount
+        SummaryCount      = $smCount
     }
 }
 
 Write-Host ''
-Write-Host ('Done. Conversations OK: ' + $okCount + '  without suggestions (404): ' + $noSuggCount + '  skipped (division): ' + $skipCount + '  failed: ' + $failCount + '  total suggestions: ' + $rows.Count)
+Write-Host ('Done. Conversations OK: ' + $okCount + '  without suggestions (404): ' + $noSuggCount + '  skipped (division): ' + $skipCount + '  failed: ' + $failCount)
+Write-Host ('Totals - suggestions: ' + $suggestionRows.Count + '  snippets: ' + $snippetRows.Count + '  summaries: ' + $summaryRows.Count)
+Write-Host ''
 
-if ($rows.Count -gt 0) {
-    # Explicit column order (New-Object -Property hashtables do not preserve it).
-    $rows |
-        Select-Object ConversationId, SuggestionId, SuggestionType, State, DateIssued,
-                      Confidence, ResourceId, ResourceTitle, KnowledgeBaseId,
-                      RetrievedAtUtc, RawJson |
-        Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
-    Write-Host ('CSV written: ' + $OutputCsv)
+# Explicit column order on every export (New-Object -Property hashtables do
+# not preserve key order).
+$convCsv = Join-Path -Path $OutputFolder -ChildPath 'Conversations.csv'
+$conversationRows |
+    Select-Object ConversationId, ConversationStart, ConversationEnd, MediaTypes,
+                  QueueName, CustomerName, SuggestionCount, SummaryCount |
+    Export-Csv -Path $convCsv -NoTypeInformation -Encoding UTF8
+Write-Host ('Written: ' + $convCsv + '  (' + $conversationRows.Count + ' rows)')
 
-    if ($OutputJson -ne '') {
-        ConvertTo-Json -InputObject $rawSuggestions -Depth 15 | Out-File -FilePath $OutputJson -Encoding UTF8
-        Write-Host ('Raw JSON written: ' + $OutputJson)
+$suggCsv = Join-Path -Path $OutputFolder -ChildPath 'Suggestions.csv'
+if ($suggestionRows.Count -gt 0) {
+    $suggestionRows |
+        Select-Object ConversationId, SuggestionId, SuggestionType, State, TriggerType,
+                      DateCreated, Confidence, Title, AnswerText, DocumentId,
+                      KnowledgeBaseId, ArticleUrl, SearchId, MediaType, QueueId,
+                      AgentUserId, ExternalContactId |
+        Export-Csv -Path $suggCsv -NoTypeInformation -Encoding UTF8
+    Write-Host ('Written: ' + $suggCsv + '  (' + $suggestionRows.Count + ' rows)')
+} else {
+    Write-Host 'No suggestions found - Suggestions.csv not written.'
+}
+
+if ($snippetRows.Count -gt 0) {
+    $snipCsv = Join-Path -Path $OutputFolder -ChildPath 'SuggestionSnippets.csv'
+    $snippetRows |
+        Select-Object ConversationId, SuggestionId, SnippetIndex, SnippetText |
+        Export-Csv -Path $snipCsv -NoTypeInformation -Encoding UTF8
+    Write-Host ('Written: ' + $snipCsv + '  (' + $snippetRows.Count + ' rows)')
+}
+
+if ($summaryRows.Count -gt 0) {
+    $summCsv = Join-Path -Path $OutputFolder -ChildPath 'Summaries.csv'
+    $summaryRows |
+        Select-Object ConversationId, SummaryId, MediaType, Language, Status,
+                      SummaryText, Confidence, ReasonText, ReasonDescription,
+                      ResolutionText, ResolutionDescription, ResolutionOutcome,
+                      FollowupText, FollowupDescription, PredictedWrapupCodes |
+        Export-Csv -Path $summCsv -NoTypeInformation -Encoding UTF8
+    Write-Host ('Written: ' + $summCsv + '  (' + $summaryRows.Count + ' rows)')
+}
+
+if ($RawJson) {
+    if ($rawSuggestions.Count -gt 0) {
+        $rawSuggPath = Join-Path -Path $OutputFolder -ChildPath 'RawSuggestions.json'
+        ConvertTo-Json -InputObject $rawSuggestions -Depth 15 | Out-File -FilePath $rawSuggPath -Encoding UTF8
+        Write-Host ('Written: ' + $rawSuggPath)
+    }
+    if ($rawSummaries.Count -gt 0) {
+        $rawSummPath = Join-Path -Path $OutputFolder -ChildPath 'RawSummaries.json'
+        ConvertTo-Json -InputObject $rawSummaries -Depth 15 | Out-File -FilePath $rawSummPath -Encoding UTF8
+        Write-Host ('Written: ' + $rawSummPath)
     }
 }
-else {
-    Write-Host 'No suggestions returned - nothing exported.'
-}
+
+Write-Host ''
+Write-Host ('Report folder ready for Power BI: ' + $OutputFolder)

@@ -307,8 +307,17 @@ function Invoke-GcApi {
             $detail = ''
             try { $detail = [string]$_.Exception.Message } catch { $detail = '' }
 
-            if     ($status -eq 401) { throw ('API call unauthorized (401). Token expired or invalid. URI: ' + $Uri) }
-            elseif ($status -eq 403) { throw ('API call forbidden (403). Check the OAuth client role has the suggestions permission AND is assigned to the conversation''s division. URI: ' + $Uri) }
+            # Genesys returns a JSON body explaining WHY a request failed
+            # (e.g. which query field a 400 rejected). PowerShell exposes it
+            # on ErrorDetails - CLM-safe, and far more useful than the
+            # generic 'Bad Request' text.
+            $apiBody = ''
+            try { $apiBody = [string]$_.ErrorDetails.Message } catch { $apiBody = '' }
+            if ($apiBody -ne '') { $detail = $detail + ' API says: ' + $apiBody }
+
+            if     ($status -eq 400) { throw ('Bad request (400). The API rejected the request body/parameters. ' + $detail + ' URI: ' + $Uri) }
+            elseif ($status -eq 401) { throw ('API call unauthorized (401). Token expired or invalid. URI: ' + $Uri) }
+            elseif ($status -eq 403) { throw ('API call forbidden (403). Check the OAuth client role has the required permission AND is assigned to the division. ' + $apiBody + ' URI: ' + $Uri) }
             elseif ($status -eq 404) { throw ('Resource not found (404). Check the conversation ID and region. URI: ' + $Uri) }
             elseif ($status -gt 0)   { throw ('API call failed (HTTP ' + $status + '): ' + $detail + ' URI: ' + $Uri) }
             else                     { throw ('API call failed (network/unknown): ' + $detail + ' URI: ' + $Uri) }
@@ -429,20 +438,25 @@ function Get-GcConversationIdsByDivision {
         while (($pageNumber -lt $maxPagesPerWindow) -and ($ids.Count -lt $Cap)) {
             $pageNumber++
 
+            # divisionId is a CONVERSATION-level dimension, so the predicate
+            # must live in conversationFilters - putting it in segmentFilters
+            # makes the API reject the query with HTTP 400.
             $queryBody = @{
-                interval       = $interval
-                order          = 'desc'
-                orderBy        = 'conversationStart'
-                paging         = @{
+                interval            = $interval
+                order               = 'desc'
+                orderBy             = 'conversationStart'
+                paging              = @{
                     pageSize   = 100
                     pageNumber = $pageNumber
                 }
-                segmentFilters = @(
+                conversationFilters = @(
                     @{
                         type       = 'or'
                         predicates = @(
                             @{
+                                type      = 'dimension'
                                 dimension = 'divisionId'
+                                operator  = 'matches'
                                 value     = $DivId
                             }
                         )

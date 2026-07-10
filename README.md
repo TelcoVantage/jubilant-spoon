@@ -43,15 +43,32 @@ exponential backoff.
    *"Could not create SSL/TLS secure channel"* fix it machine-wide via the
    `SystemDefaultTlsVersions` / `SchUseStrongCrypto` registry values (GPO/admin).
 
+## One-time setup: embed your credentials
+
+The script ships pre-configured for the **Australia (Sydney) region**
+(`mypurecloud.com.au`) with the OAuth credentials embedded in a config block
+near the top of the file. Edit these two lines before first use:
+
+```powershell
+$EmbeddedClientId     = 'PASTE-YOUR-CLIENT-ID-HERE'
+$EmbeddedClientSecret = 'PASTE-YOUR-CLIENT-SECRET-HERE'
+```
+
+The script refuses to run while the placeholders are still in place.
+Command-line `-ClientId` / `-ClientSecret` / `-Region` still override the
+embedded values when supplied.
+
+> **Security:** embedded credentials are readable by anyone who can read the
+> file. Restrict NTFS permissions on the script, and scope the OAuth client's
+> role to just the suggestions-view permission in the one division you query.
+> Never commit the file with real credentials to source control.
+
 ## Usage
 
-Single conversation:
+Single conversation (embedded region + credentials, nothing else needed):
 
 ```powershell
 .\Get-GcConversationSuggestions.ps1 `
-    -Region usw2.pure.cloud `
-    -ClientId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
-    -ClientSecret 'your-secret' `
     -ConversationId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 ```
 
@@ -64,8 +81,6 @@ $convIds = @(
 )
 
 .\Get-GcConversationSuggestions.ps1 `
-    -Region mypurecloud.ie `
-    -ClientId $id -ClientSecret $secret `
     -ConversationId $convIds `
     -DivisionId '11111111-2222-3333-4444-555555555555' `
     -OutputCsv C:\Reports\suggestions.csv `
@@ -83,8 +98,8 @@ Re-use an existing bearer token (skips the token request entirely):
 
 | Parameter | Required | Description |
 |---|---|---|
-| `-Region` | no | Region domain only, e.g. `mypurecloud.com`, `usw2.pure.cloud`, `mypurecloud.ie` (default `mypurecloud.com`) |
-| `-ClientId` / `-ClientSecret` | yes* | Client Credentials OAuth pair (*unless `-AccessToken` is given) |
+| `-Region` | no | Region domain only; defaults to embedded `mypurecloud.com.au` (Australia) |
+| `-ClientId` / `-ClientSecret` | no | Override the embedded Client Credentials pair |
 | `-AccessToken` | no | Existing bearer token; bypasses the token request |
 | `-ConversationId` | yes | One or more conversation IDs (same division) |
 | `-DivisionId` | no | Verifies each conversation's division via `GET /api/v2/conversations/{id}` first; mismatches are skipped with a warning |

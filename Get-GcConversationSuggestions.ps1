@@ -30,18 +30,19 @@
     SchUseStrongCrypto) - that is an admin/GPO change, not a script change.
 
 .PARAMETER Region
-    Genesys Cloud region domain (NOT the full URL). Examples:
+    Genesys Cloud region domain (NOT the full URL). Defaults to the embedded
+    value 'mypurecloud.com.au' (Australia / Sydney). Other examples:
       mypurecloud.com  mypurecloud.ie  mypurecloud.de  mypurecloud.jp
-      mypurecloud.com.au  usw2.pure.cloud  cac1.pure.cloud  euw2.pure.cloud
-      euc2.pure.cloud  aps1.pure.cloud  apne2.pure.cloud  sae1.pure.cloud
-      mec1.pure.cloud
-    Default: mypurecloud.com
+      usw2.pure.cloud  cac1.pure.cloud  euw2.pure.cloud  euc2.pure.cloud
+      aps1.pure.cloud  apne2.pure.cloud  sae1.pure.cloud  mec1.pure.cloud
 
 .PARAMETER ClientId
-    OAuth client ID (Client Credentials grant).
+    OAuth client ID (Client Credentials grant). Defaults to the embedded
+    $EmbeddedClientId value in the configuration block below.
 
 .PARAMETER ClientSecret
-    OAuth client secret.
+    OAuth client secret. Defaults to the embedded $EmbeddedClientSecret value
+    in the configuration block below.
 
 .PARAMETER AccessToken
     Optional. Supply an existing bearer token to skip the token request
@@ -66,16 +67,12 @@
     as pretty-printed JSON for full-fidelity inspection.
 
 .EXAMPLE
+    # Uses the embedded region + credentials - only the conversation ID needed
     .\Get-GcConversationSuggestions.ps1 `
-        -Region usw2.pure.cloud `
-        -ClientId 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx' `
-        -ClientSecret 'your-secret' `
         -ConversationId 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
 
 .EXAMPLE
     .\Get-GcConversationSuggestions.ps1 `
-        -Region mypurecloud.ie `
-        -ClientId $id -ClientSecret $secret `
         -ConversationId $convIds `
         -DivisionId '11111111-2222-3333-4444-555555555555' `
         -OutputCsv C:\Reports\suggestions.csv `
@@ -85,7 +82,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false)]
-    [string]$Region = 'mypurecloud.com',
+    [string]$Region = '',
 
     [Parameter(Mandatory = $false)]
     [string]$ClientId = '',
@@ -114,6 +111,27 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ===========================================================================
+# EMBEDDED CONFIGURATION - Australia (Sydney) region
+# Paste your OAuth Client Credentials pair below. Command-line -ClientId /
+# -ClientSecret / -Region parameters still work and override these values.
+#
+# SECURITY: anyone who can read this file can read these credentials. Restrict
+# NTFS permissions on the script and scope the OAuth client's role to the
+# minimum permissions (suggestions view) in the one division you query.
+# ===========================================================================
+$EmbeddedRegion       = 'mypurecloud.com.au'
+$EmbeddedClientId     = 'PASTE-YOUR-CLIENT-ID-HERE'
+$EmbeddedClientSecret = 'PASTE-YOUR-CLIENT-SECRET-HERE'
+
+if ($Region -eq '')       { $Region       = $EmbeddedRegion }
+if ($ClientId -eq '')     { $ClientId     = $EmbeddedClientId }
+if ($ClientSecret -eq '') { $ClientSecret = $EmbeddedClientSecret }
+
+if (($AccessToken -eq '') -and (($ClientId -like 'PASTE-YOUR-*') -or ($ClientSecret -like 'PASTE-YOUR-*'))) {
+    throw 'Embedded credentials are still placeholders. Edit $EmbeddedClientId / $EmbeddedClientSecret at the top of the script (or pass -ClientId / -ClientSecret).'
+}
 
 $loginBase = 'https://login.' + $Region
 $apiBase   = 'https://api.' + $Region
